@@ -1,4 +1,7 @@
-# 文件: dataset_video.py (版本 3 - 支持 train/val 划分和评估模式)
+# 文件: dataset_video.py (版本 4 - 修复 __getitem__ unpack 错误)
+# 核心改动:
+# 1. 在 __getitem__ 中，根据样本类型 ('clip' or 'sequence') 安全地解包元组，
+#    以处理训练样本(4个元素)和验证样本(3个元素)的不同结构。
 
 import os
 import torch
@@ -35,7 +38,7 @@ class VideoDetectionDataset(Dataset):
 
         self.data_samples = []
         if self.mode == 'train':
-            # 在训练模式下，创建视频片段
+            # 在训练模式下，创建视频片段 (4-element tuple)
             for seq_name in self.sequences:
                 seq_path = os.path.join(self.image_dir, seq_name)
                 frame_files = sorted(os.listdir(seq_path), key=lambda x: int(os.path.splitext(x)[0].split('_')[-1]))
@@ -45,7 +48,7 @@ class VideoDetectionDataset(Dataset):
                     for start_frame in range(num_frames - clip_length + 1):
                         self.data_samples.append(('clip', seq_name, start_frame, frame_files))
         else:  # 'val' mode
-            # 在验证模式下，每个样本是一个完整的序列
+            # 在验证模式下，每个样本是一个完整的序列 (3-element tuple)
             for seq_name in self.sequences:
                 seq_path = os.path.join(self.image_dir, seq_name)
                 frame_files = sorted(os.listdir(seq_path), key=lambda x: int(os.path.splitext(x)[0].split('_')[-1]))
@@ -54,14 +57,22 @@ class VideoDetectionDataset(Dataset):
     def __len__(self):
         return len(self.data_samples)
 
+    # ================================== 核心修复点 ==================================
     def __getitem__(self, idx):
-        sample_type, seq_name, arg, frame_files = self.data_samples[idx]
+        sample_info = self.data_samples[idx]
+        sample_type = sample_info[0]
 
         if sample_type == 'clip':
-            start_frame = arg
+            # 训练模式样本: ('clip', seq_name, start_frame, frame_files)
+            _, seq_name, start_frame, frame_files = sample_info
             return self._get_clip(seq_name, start_frame, frame_files)
-        else:  # 'sequence'
+        elif sample_type == 'sequence':
+            # 验证模式样本: ('sequence', seq_name, frame_files)
+            _, seq_name, frame_files = sample_info
             return self._get_sequence(seq_name, frame_files)
+        else:
+            raise ValueError(f"Unknown sample type: {sample_type}")
+    # ==============================================================================
 
     def _get_clip(self, seq_name, start_frame, frame_files):
         clip_images = []
@@ -70,7 +81,6 @@ class VideoDetectionDataset(Dataset):
             frame_idx = start_frame + i
             frame_filename = frame_files[frame_idx]
 
-            # ... (这部分与之前版本相同)
             img_path = os.path.join(self.image_dir, seq_name, frame_filename)
             image = Image.open(img_path).convert('RGB')
             if self.transform:
@@ -105,7 +115,6 @@ class VideoDetectionDataset(Dataset):
         sequence_images = []
         sequence_targets = []
         for frame_filename in frame_files:
-            # ... (与 _get_clip 几乎相同)
             img_path = os.path.join(self.image_dir, seq_name, frame_filename)
             image = Image.open(img_path).convert('RGB')
             if self.transform:

@@ -1,4 +1,6 @@
 # 文件: main_finetune_video.py (诊断版本)
+# 核心改动:
+# 1. 将 epoch 和 output_dir 传递给 evaluate 函数，以便可视化函数可以创建带有纪元编号的文件。
 
 import argparse
 import os
@@ -19,7 +21,6 @@ def collate_fn_train(batch):
 
 
 def collate_fn_val(batch):
-    # For validation, batch size is 1 and it contains a single tuple (sequence, targets)
     return batch[0]
 
 
@@ -39,10 +40,7 @@ def get_args_parser():
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int)
-    # ================================== 核心诊断点 1/2 ==================================
-    # 将 num_workers 的默认值改为 0，以便从命令行直接运行诊断
     parser.add_argument('--num_workers', default=0, type=int)
-    # ==============================================================================
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--local_rank', default=-1, type=int)
     parser.add_argument('--dist_on_itp', action='store_true')
@@ -57,8 +55,6 @@ def main(args):
 
     device = torch.device(args.device)
     cudnn.benchmark = True
-
-    print(f"!!! DIAGNOSTIC MODE: Using num_workers = {args.num_workers} !!!")
 
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
@@ -117,13 +113,16 @@ def main(args):
             model, data_loader_train, optimizer, device, epoch, args=args
         )
 
-        eval_stats = evaluate(model_without_ddp, data_loader_val, device)
+        # ========================= 核心修改点 =========================
+        # 将 epoch 和 output_dir 传递给 evaluate 函数
+        eval_stats = evaluate(model_without_ddp, data_loader_val, device, args.output_dir, epoch)
+        # ==============================================================
 
         print(f"--- Epoch {epoch} Evaluation ---")
-        print(f"  目标识别召回率 (Recall):    {eval_stats['avg_recall']:.4f}")
-        print(f"  目标识别虚警率 (False Alarm): {eval_stats['avg_false_alarm']:.4f}")
-        print(f"  时空序列稳定性 (Stability):   {eval_stats['spatial_stability']:.4f}")
-        print("--------------------------")
+        print(f"  目标识别召回率:      {eval_stats['avg_recall']:.4f}")
+        print(f"  目标识别虚警率:      {eval_stats['avg_false_alarm']:.4f}")
+        print(f"  时空序列稳定性:      {eval_stats['spatial_stability']:.4f}")
+        print("-----------------------------")
 
         if args.output_dir and misc.is_main_process():
             torch.save({
