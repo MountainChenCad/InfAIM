@@ -1,4 +1,7 @@
-# util/visualize.py
+# util/visualize.py (版本 2 - 修复 numpy 转换错误)
+# 核心改动:
+# 1. 在将 pred_logits 和 pred_boxes 张量转换为 numpy 或从中计算派生值之前，
+#    调用 .detach()。这可以防止在张量需要计算梯度时（例如在训练循环中）发生运行时错误。
 
 import cv2
 import numpy as np
@@ -40,7 +43,10 @@ def save_eval_video(image_sequence, gt_targets, pred_boxes, pred_logits, output_
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video_writer = cv2.VideoWriter(output_path, fourcc, 10.0, (W, H))
 
-    pred_probs = pred_logits.softmax(-1)
+    # ========================= 核心修改点 1 =========================
+    # 在计算前分离张量，以避免梯度问题
+    pred_probs = pred_logits.detach().softmax(-1)
+    # ==============================================================
     pred_scores, pred_labels = pred_probs.max(-1)
 
     for i in range(len(image_sequence)):
@@ -66,7 +72,10 @@ def save_eval_video(image_sequence, gt_targets, pred_boxes, pred_logits, output_
         score = pred_scores[i].item()
         label = pred_labels[i].item()
         if score > conf_threshold and label < num_classes:
-            box_cxcywh = pred_boxes[i].cpu().numpy()
+            # ========================= 核心修改点 2 =========================
+            # 在转换前分离张量，以避免梯度问题
+            box_cxcywh = pred_boxes[i].cpu().detach().numpy()
+            # ==============================================================
             box_xyxy = box_cxcywh_to_xyxy_numpy(box_cxcywh)
             # Denormalize coordinates
             x1, y1, x2, y2 = (box_xyxy * np.array([W, H, W, H])).astype(int)

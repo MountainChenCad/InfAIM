@@ -346,12 +346,16 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
                 args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
+        # ========================= 核心修改点 =========================
+        # 使用 'model_state_dict' 键来匹配保存时的键
+        model_without_ddp.load_state_dict(checkpoint['model_state_dict'])
         print("Resume checkpoint %s" % args.resume)
-        if 'optimizer' in checkpoint and 'epoch' in checkpoint and not (hasattr(args, 'eval') and args.eval):
-            optimizer.load_state_dict(checkpoint['optimizer'])
+        # 使用 'optimizer_state_dict' 键
+        if 'optimizer_state_dict' in checkpoint and 'epoch' in checkpoint and not (hasattr(args, 'eval') and args.eval):
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # ==============================================================
             args.start_epoch = checkpoint['epoch'] + 1
-            if 'scaler' in checkpoint:
+            if 'scaler' in checkpoint and loss_scaler is not None:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
             print("With optim & sched!")
 
