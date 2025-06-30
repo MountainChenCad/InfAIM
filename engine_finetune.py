@@ -1,10 +1,8 @@
-# 文件: engine_finetune.py (版本 26 - 重新引入 L2 回归损失)
+# 文件: engine_finetune.py (版本 29 - 简化可视化调用)
 # 核心改动:
-# 1. (BUG FIX) 重新引入了一个直接的回归损失（L2 Loss），以解决边界框尺寸不正确和多目标检测效果差的问题。
-#    这个损失函数会直接惩罚预测框和真实框之间的坐标差异。
-# 2. (FEATURE) 更新了 `weight_dict`，为新的 `loss_l2` 分配了一个较低的权重（2），
-#    同时保持 CIoU Loss 作为主要的几何损失（权重为 5），以平衡训练过程。
-# 3. (REFACTOR) 更新了日志记录，以包含所有三个损失项，从而提供对训练动态的全面洞察。
+# 1. (REFACTOR) 极大地简化了 `visualize_epoch` 函数。
+#    - 它现在只负责运行模型推理，然后将完整、密集的原始预测张量直接传递给 `save_eval_video`。
+#    - 所有 NMS 和过滤逻辑都已从中移除，并转移到它所属的 `save_eval_video` 工具函数中。
 
 import math
 import sys
@@ -13,7 +11,7 @@ import torch
 import torch.nn.functional as F
 import util.misc as misc
 from util.visualize import save_eval_video
-from torchvision.ops.boxes import box_iou
+from torchvision.ops.boxes import box_iou, nms
 import numpy as np
 import os
 
@@ -91,11 +89,8 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
                 matched_preds_logits = frame_logits[matched_pred_indices]
                 matched_preds_boxes = frame_boxes[matched_pred_indices]
                 total_loss_ce += F.cross_entropy(matched_preds_logits, gt_labels)
-
-                # ========================= 核心修改点 1: 添加 L2 Loss 计算 =========================
                 total_loss_ciou += ciou_loss(matched_preds_boxes, gt_boxes).sum()
                 total_loss_l2 += F.mse_loss(matched_preds_boxes, gt_boxes, reduction='sum')
-                # =================================================================================
 
                 unmatched_mask = torch.ones(N, dtype=torch.bool, device=device)
                 unmatched_mask[matched_pred_indices] = False
@@ -109,12 +104,9 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
         loss_ciou_avg = total_loss_ciou / num_pos if num_pos > 0 else torch.tensor(0.0, device=device)
         loss_l2_avg = total_loss_l2 / num_pos if num_pos > 0 else torch.tensor(0.0, device=device)
 
-        # ========================= 核心修改点 2: 更新权重字典 =========================
         weight_dict = {'loss_ce': 2, 'loss_ciou': 5, 'loss_l2': 2}
-        losses = (loss_ce_avg * weight_dict['loss_ce'] +
-                  loss_ciou_avg * weight_dict['loss_ciou'] +
-                  loss_l2_avg * weight_dict['loss_l2'])
-        # =========================================================================
+        losses = (loss_ce_avg * weight_dict['loss_ce'] + loss_ciou_avg * weight_dict['loss_ciou'] + loss_l2_avg *
+                  weight_dict['loss_l2'])
 
         if not math.isfinite(losses.item()):
             print(f"Loss is {losses.item()}, stopping training")
@@ -124,14 +116,8 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
         losses.backward()
         optimizer.step()
         torch.cuda.synchronize()
-
-        # ========================= 核心修改点 3: 更新日志记录 =========================
-        metric_logger.update(loss=losses.item(),
-                             loss_ce=loss_ce_avg.item(),
-                             loss_ciou=loss_ciou_avg.item(),
+        metric_logger.update(loss=losses.item(), loss_ce=loss_ce_avg.item(), loss_ciou=loss_ciou_avg.item(),
                              loss_l2=loss_l2_avg.item())
-        # =========================================================================
-
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
     metric_logger.synchronize_between_processes()
@@ -147,6 +133,7 @@ def evaluate(model, data_loader, device, output_dir, epoch):
     stats_by_class = {i: {'tp': 0, 'fp': 0, 'fn': 0} for i in range(model.num_classes)}
     stable_sequences, total_sequences = 0, 0
     iou_threshold, stability_threshold, conf_threshold = 0.3, 0.8, 0.5
+    nms_threshold = 0.5
     clip_length = model.clip_length
 
     for seq_name, sequence_cpu, targets in metric_logger.log_every(data_loader, 10, header):
@@ -173,32 +160,40 @@ def evaluate(model, data_loader, device, output_dir, epoch):
 
             probs = F.softmax(frame_logits, -1)
             scores, labels = probs.max(-1)
-            keep = scores > conf_threshold
 
-            frame_pred_boxes_xyxy = box_cxcywh_to_xyxy(frame_boxes_cxcywh[keep])
-            frame_pred_labels = labels[keep]
+            keep = (labels < model.num_classes) & (scores > conf_threshold)
+
+            if keep.sum() > 0:
+                kept_boxes_xyxy = box_cxcywh_to_xyxy(frame_boxes_cxcywh[keep])
+                kept_scores = scores[keep]
+                kept_labels = labels[keep]
+
+                nms_indices = nms(kept_boxes_xyxy, kept_scores, nms_threshold)
+
+                final_boxes = kept_boxes_xyxy[nms_indices]
+                final_labels = kept_labels[nms_indices]
+            else:
+                final_boxes = torch.empty((0, 4), device=device)
+                final_labels = torch.empty(0, dtype=torch.int64, device=device)
 
             gt_matched = torch.zeros(gt_labels.shape[0], device=device, dtype=torch.bool)
 
-            if frame_pred_boxes_xyxy.shape[0] > 0 and gt_boxes_xyxy.shape[0] > 0:
-                iou_matrix = box_iou(frame_pred_boxes_xyxy, gt_boxes_xyxy)
+            if final_boxes.shape[0] > 0 and gt_boxes_xyxy.shape[0] > 0:
+                iou_matrix = box_iou(final_boxes, gt_boxes_xyxy)
                 if iou_matrix.max() > iou_threshold:
                     consistent_frames += 1
-                for i in range(frame_pred_boxes_xyxy.shape[0]):
-                    pred_label = frame_pred_labels[i].item()
-                    if pred_label < model.num_classes:
-                        best_iou, best_gt_idx = iou_matrix[i].max(0)
-                        if best_iou > iou_threshold and pred_label == gt_labels[best_gt_idx].item() and not gt_matched[
-                            best_gt_idx]:
-                            stats_by_class[pred_label]['tp'] += 1
-                            gt_matched[best_gt_idx] = True
-                        else:
-                            stats_by_class[pred_label]['fp'] += 1
-            elif frame_pred_boxes_xyxy.shape[0] > 0:
-                for i in range(frame_pred_boxes_xyxy.shape[0]):
-                    pred_label = frame_pred_labels[i].item()
-                    if pred_label < model.num_classes:
+                for i in range(final_boxes.shape[0]):
+                    pred_label = final_labels[i].item()
+                    best_iou, best_gt_idx = iou_matrix[i].max(0)
+                    if best_iou > iou_threshold and pred_label == gt_labels[best_gt_idx].item() and not gt_matched[
+                        best_gt_idx]:
+                        stats_by_class[pred_label]['tp'] += 1
+                        gt_matched[best_gt_idx] = True
+                    else:
                         stats_by_class[pred_label]['fp'] += 1
+            elif final_boxes.shape[0] > 0:
+                for i in range(final_boxes.shape[0]):
+                    stats_by_class[final_labels[i].item()]['fp'] += 1
 
             unmatched_gt_labels = gt_labels[gt_matched.logical_not()]
             for label in unmatched_gt_labels:
@@ -228,6 +223,7 @@ def visualize_epoch(model, data_loader, device, output_dir, epoch, vis_folder_na
     clip_length = model.clip_length
     header = f'Visualizing {vis_folder_name}:'
     metric_logger = misc.MetricLogger(delimiter="  ")
+
     for seq_name, sequence_cpu, targets in metric_logger.log_every(data_loader, 1, header):
         sequence_gpu = sequence_cpu.to(device)
         sequence_len = sequence_gpu.shape[0]
@@ -239,16 +235,13 @@ def visualize_epoch(model, data_loader, device, output_dir, epoch, vis_folder_na
             all_pred_logits.append(outputs['pred_logits'].squeeze(0))
             all_pred_boxes.append(outputs['pred_boxes'].squeeze(0))
 
+        # ========================= 核心修改点 =========================
+        # 直接传递完整、密集的预测结果到可视化函数
         full_pred_logits = torch.cat(all_pred_logits, dim=0)
         full_pred_boxes = torch.cat(all_pred_boxes, dim=0)
 
-        probs = F.softmax(full_pred_logits, dim=-1)
-        all_scores, _ = probs[..., :-1].max(dim=-1)
-        best_patch_indices = all_scores.argmax(dim=-1)
-
-        vis_logits = torch.stack([full_pred_logits[t, best_patch_indices[t]] for t in range(sequence_len)])
-        vis_boxes = torch.stack([full_pred_boxes[t, best_patch_indices[t]] for t in range(sequence_len)])
-
         video_path = os.path.join(vis_dir, f"{seq_name}_epoch_{epoch}.mp4")
-        save_eval_video(sequence_cpu, targets, vis_boxes.cpu(), vis_logits.cpu(),
-                        video_path, model.num_classes, conf_threshold=0.5)
+        # 将NMS和过滤逻辑完全委托给 save_eval_video
+        save_eval_video(sequence_cpu, targets, full_pred_boxes.cpu(), full_pred_logits.cpu(),
+                        video_path, model.num_classes, conf_threshold=0.5, nms_threshold=0.5)
+        # ==============================================================
