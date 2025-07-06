@@ -1,14 +1,15 @@
-# util/visualize.py (版本 3 - 实现帧内 NMS)
+# util/visualize.py (版本 4 - CenterNet 可视化工具)
 # 核心改动:
-# 1. (FEATURE) `save_eval_video` 函数现在可以接受密集的预测张量（T, N, Dims）。
-# 2. (BUG FIX) 修复了 `IndexError`。函数现在会在其主循环内部逐帧执行置信度过滤和 NMS。
-#    这确保了它可以正确处理有多个、一个或零个检测的帧，而不会崩溃。
+# 1. (REFACTOR) `save_eval_video` 函数的签名被彻底改变。它现在接受一个 `predictions` 列表，
+#    其中每个元素都是一个包含单帧所有检测结果的字典。
+# 2. (REFACTOR) 函数不再执行任何模型相关的逻辑（如 softmax, NMS）。它只负责绘制
+#    已经经过后处理的、干净的边界框列表。
+# 3. (FEATURE) 内部循环现在会遍历每一帧的预测框列表，并在图像上绘制所有检测到的目标，
+#    从而能够正确地可视化多目标检测结果。
 
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
-from torchvision.ops.boxes import nms
 
 
 def box_cxcywh_to_xyxy_numpy(box):
@@ -20,14 +21,6 @@ def box_cxcywh_to_xyxy_numpy(box):
     return np.array([x1, y1, x2, y2])
 
 
-def box_cxcywh_to_xyxy_torch(x):
-    x_c, y_c, w, h = x.unbind(-1)
-    b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
-         (x_c + 0.5 * w), (y_c + 0.5 * h)]
-    return torch.stack(b, dim=-1)
-
-
-# A distinct color for each class ID
 CLASS_COLORS = [
     (255, 56, 56), (255, 157, 151), (255, 112, 31), (255, 178, 29),
     (207, 210, 49), (72, 249, 10), (146, 204, 23)
@@ -36,8 +29,14 @@ GT_COLOR = (0, 255, 0)
 TEXT_COLOR = (255, 255, 255)
 
 
-def save_eval_video(image_sequence, gt_targets, pred_boxes_cxcywh, pred_logits, output_path, num_classes,
-                    conf_threshold=0.5, nms_threshold=0.5):
+def save_eval_video(image_sequence, gt_targets, predictions, output_path):
+    """
+    Saves a video with ground truth and predicted bounding boxes from CenterNet-style output.
+    - image_sequence: (T, C, H, W) tensor of original images.
+    - gt_targets: List of T dictionaries, each with 'boxes' and 'labels' (original GT).
+    - predictions: List of T dictionaries, each with post-processed 'boxes', 'scores', 'labels'.
+    - output_path: Path to save the .mp4 video.
+    """
     _, _, H, W = image_sequence.shape
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video_writer = cv2.VideoWriter(output_path, fourcc, 10.0, (W, H))
@@ -49,43 +48,29 @@ def save_eval_video(image_sequence, gt_targets, pred_boxes_cxcywh, pred_logits, 
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
         # Draw Ground Truth boxes
-        gt_boxes_np = gt_targets[i]['boxes'].numpy()
-        gt_labels_np = gt_targets[i]['labels'].numpy()
-        for box, label in zip(gt_boxes_np, gt_labels_np):
-            box_xyxy = box_cxcywh_to_xyxy_numpy(box)
-            x1, y1, x2, y2 = (box_xyxy * np.array([W, H, W, H])).astype(int)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), GT_COLOR, 2)
-            cv2.putText(frame, f'GT: {label}', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, GT_COLOR, 2)
-
-        # ========================= 核心修改点: 在函数内部执行 NMS =========================
-        # 1. 获取当前帧的预测
-        frame_logits = pred_logits[i]
-        frame_boxes_cxcywh = pred_boxes_cxcywh[i]
-
-        # 2. 置信度过滤
-        probs = F.softmax(frame_logits, dim=-1)
-        scores, labels = probs.max(-1)
-        keep = (labels < num_classes) & (scores > conf_threshold)
-
-        if keep.sum() > 0:
-            # 3. 对保留的预测应用 NMS
-            kept_boxes_xyxy = box_cxcywh_to_xyxy_torch(frame_boxes_cxcywh[keep])
-            kept_scores = scores[keep]
-
-            nms_indices = nms(kept_boxes_xyxy, kept_scores, nms_threshold)
-
-            # 4. 绘制所有通过 NMS 的框
-            for idx in nms_indices:
-                box_xyxy = kept_boxes_xyxy[idx].cpu().numpy()
-                score = kept_scores[idx].item()
-                label = labels[keep][idx].item()
-
+        if i < len(gt_targets):
+            gt_boxes_np = gt_targets[i]['boxes'].numpy()
+            gt_labels_np = gt_targets[i]['labels'].numpy()
+            for box, label in zip(gt_boxes_np, gt_labels_np):
+                box_xyxy = box_cxcywh_to_xyxy_numpy(box)
                 x1, y1, x2, y2 = (box_xyxy * np.array([W, H, W, H])).astype(int)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), GT_COLOR, 2)
+                cv2.putText(frame, f'GT: {label}', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, GT_COLOR, 2)
+
+        # Draw Predicted boxes for the current frame
+        if i < len(predictions):
+            pred_boxes = predictions[i]['boxes'].cpu().numpy()
+            pred_scores = predictions[i]['scores'].cpu().numpy()
+            pred_labels = predictions[i]['labels'].cpu().numpy()
+
+            for box, score, label in zip(pred_boxes, pred_scores, pred_labels):
+                box_xyxy = box_cxcywh_to_xyxy_numpy(box)
+                x1, y1, x2, y2 = (box_xyxy * np.array([W, H, W, H])).astype(int)
+
                 color = CLASS_COLORS[label % len(CLASS_COLORS)]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 text = f'P: {label} ({score:.2f})'
                 cv2.putText(frame, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_COLOR, 2)
-        # =================================================================================
 
         video_writer.write(frame)
 

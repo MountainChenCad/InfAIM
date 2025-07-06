@@ -1,131 +1,158 @@
-# 文件: models_aim.py (版本 3 - LoRA 微调)
+# 文件: models_aim.py (版本 7 - 终极架构: AIM主干 + CenterNet头)
 # 核心改动:
-# 1. (REFACTOR) 完全移除了之前的 `Adapter` 和 `AIMBlock` 类。
-# 2. (FEATURE) 实现了标准的 LoRA (Low-Rank Adaptation) 微调方法。
-#    - `LoraLayer`: 定义了 LoRA 的核心低秩矩阵 A 和 B。
-#    - `LoraInjectedLinear`: 一个包装器，将 LoraLayer "注入" 到一个冻结的 nn.Linear 层中。
-# 3. (REFACTOR) 在 `AIM_InfMAE_Detector` 的初始化过程中，我们现在遍历 Transformer blocks，
-#    并将 `qkv` 和 `proj` 线性层替换为 `LoraInjectedLinear` 包装器。这是一种更简洁、更标准的 PEFT 方法。
-# 4. (REFACTOR) `forward` 传递过程被简化，以匹配原始的 InfMAE 骨干网络，从而移除了复杂的 AIMBlock 逻辑。
+# 1. (FEATURE) 实现了理论上最优的混合架构，结合了两种设计的优点：
+#    - AIM + Adapter: 用于主干网络，专门为视频任务优化，解耦时空注意力。
+#    - CenterNet Head: 用于检测头，专门为微小和密集目标检测优化。
+# 2. (REFACTOR) 重新引入了 `Adapter` 和 `AIMBlock` 的定义。
+# 3. (REFACTOR) 在模型初始化时，使用 `AIMBlock` 替换了骨干网络的 `blocks3`，
+#    同时保留了可训练的 `CenterNetHead`。
+# 4. (REFACTOR) `forward` 传递过程被更新，以正确地将第二阶段的特征送入检测头，
+#    同时完成整个骨干网络的时空计算。
 
-from functools import partial
 import torch
 import torch.nn as nn
-import math
 from models_infmae_skip4 import infmae_vit_base_patch16
+import math
 
 
-class LoraLayer(nn.Module):
-    """
-    LoRA (Low-Rank Adaptation) a a single linear layer.
-    """
-
-    def __init__(self, in_features, out_features, r, alpha):
+# ========================= AIM + Adapter 模块定义 =========================
+class Adapter(nn.Module):
+    def __init__(self, dim, mlp_ratio=0.25):
         super().__init__()
-        self.r = r
-        self.alpha = alpha
-
-        self.lora_A = nn.Linear(in_features, r, bias=False)
-        self.lora_B = nn.Linear(r, out_features, bias=False)
-
-        # Initialize A with Kaiming uniform and B with zeros
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B.weight)
+        hidden_dim = int(dim * mlp_ratio)
+        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, dim)
+        self.activation = nn.GELU()
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
 
     def forward(self, x):
-        return self.lora_B(self.lora_A(x)) * self.alpha
+        return self.fc2(self.activation(self.fc1(x)))
 
 
-class LoraInjectedLinear(nn.Module):
-    """
-    A wrapper for a linear layer that injects LoRA.
-    """
-
-    def __init__(self, original_layer, r, alpha):
+class AIMBlock(nn.Module):
+    def __init__(self, original_block, mlp_ratio=0.25, scale=0.5):
         super().__init__()
-        self.original_layer = original_layer  # This layer is frozen
+        self.scale = scale
+        dim = original_block.norm1.normalized_shape[0]
+        # Reference frozen layers
+        self.attn = original_block.attn
+        self.norm1 = original_block.norm1
+        self.mlp = original_block.mlp
+        self.norm2 = original_block.norm2
+        self.drop_path = original_block.drop_path
+        # Create new trainable adapters
+        self.t_adapter = Adapter(dim, mlp_ratio)
+        self.s_adapter = Adapter(dim, mlp_ratio)
+        self.mlp_adapter = Adapter(dim, mlp_ratio)
 
-        self.lora_layer = LoraLayer(
-            original_layer.in_features,
-            original_layer.out_features,
-            r,
-            alpha
+    def forward(self, x, num_frames):
+        bt, n, d = x.shape
+        b = bt // num_frames
+        t = num_frames
+        # Temporal Adaptation
+        x_norm_t = self.norm1(x)
+        x_for_t_attn = x_norm_t.view(b, t, n, d).permute(0, 2, 1, 3).reshape(b * n, t, d)
+        t_attn_out = self.attn(x_for_t_attn)
+        t_attn_out_reshaped = t_attn_out.view(b, n, t, d).permute(0, 2, 1, 3).reshape(bt, n, d)
+        x_after_t = x + self.t_adapter(t_attn_out_reshaped)
+        # Spatial Adaptation
+        s_attn_out = self.attn(self.norm1(x_after_t))
+        x_after_s = x_after_t + self.s_adapter(s_attn_out)
+        # Joint Adaptation
+        x_mlp_in = x_after_s
+        x_norm2 = self.norm2(x_mlp_in)
+        mlp_out = self.mlp(x_norm2)
+        mlp_adapter_out = self.mlp_adapter(x_norm2)
+        final_x = x_mlp_in + self.drop_path(mlp_out) + self.scale * self.drop_path(mlp_adapter_out)
+        return final_x
+
+
+# =========================================================================
+
+class CenterNetHead(nn.Module):
+    def __init__(self, in_channels, head_channels, num_classes):
+        super(CenterNetHead, self).__init__()
+        self.heatmap = nn.Sequential(
+            nn.Conv2d(in_channels, head_channels, kernel_size=3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(head_channels, num_classes, kernel_size=1, stride=1, padding=0, bias=True)
+        )
+        self.wh = nn.Sequential(
+            nn.Conv2d(in_channels, head_channels, kernel_size=3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(head_channels, 2, kernel_size=1, stride=1, padding=0, bias=True)
+        )
+        self.offset = nn.Sequential(
+            nn.Conv2d(in_channels, head_channels, kernel_size=3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(head_channels, 2, kernel_size=1, stride=1, padding=0, bias=True)
         )
 
     def forward(self, x):
-        # The original layer is in eval mode and frozen
-        original_output = self.original_layer(x)
-        # The LoRA layer is in train mode and trainable
-        lora_output = self.lora_layer(x)
-        return original_output + lora_output
+        hm = self.heatmap(x).sigmoid()
+        wh = self.wh(x)
+        offset = self.offset(x)
+        return {'hm': hm, 'wh': wh, 'offset': offset}
 
 
 class AIM_InfMAE_Detector(nn.Module):
-    """
-    Infrared video detector using a frozen InfMAE backbone adapted with LoRA.
-    """
-
-    def __init__(self, pretrained_infmae_path, num_classes, clip_length=8, lora_rank=16, lora_alpha=16):
+    def __init__(self, pretrained_infmae_path, num_classes, clip_length=8):
         super().__init__()
         self.num_classes = num_classes
         self.clip_length = clip_length
-
-        # 1. Load backbone
         self.backbone = infmae_vit_base_patch16(norm_pix_loss=False)
         print(f"Loading pretrained weights from {pretrained_infmae_path}")
         checkpoint = torch.load(pretrained_infmae_path, map_location='cpu')
         self.backbone.load_state_dict(checkpoint['model'], strict=False)
         print("Pretrained weights loaded successfully.")
 
-        # 2. Freeze all backbone parameters
+        # 1. Freeze all original backbone parameters
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        # 3. Inject LoRA layers into the attention blocks
-        for block in self.backbone.blocks3:
-            block.attn.qkv = LoraInjectedLinear(block.attn.qkv, r=lora_rank, alpha=lora_alpha)
-            block.attn.proj = LoraInjectedLinear(block.attn.proj, r=lora_rank, alpha=lora_alpha)
+        # 2. Inject AIMBlocks with trainable adapters into Stage 3
+        print("Injecting AIM blocks with trainable adapters...")
+        self.backbone.blocks3 = nn.ModuleList([
+            AIMBlock(original_block=blk) for blk in self.backbone.blocks3
+        ])
+        print("AIM injection complete.")
 
-        # 4. Define the trainable detection head
-        embed_dim = self.backbone.pos_embed.shape[-1]
-        self.detection_head = nn.Linear(embed_dim, num_classes + 1 + 4)  # +1 for background
+        # 3. Define the trainable CenterNet detection head
+        in_channels_for_head = 384  # Stage 2 feature map dimension
+        self.detection_head = CenterNetHead(in_channels=in_channels_for_head, head_channels=256,
+                                            num_classes=self.num_classes)
 
     def forward(self, video_clip):
         B, T, C, H, W = video_clip.shape
         frames_flat = video_clip.view(B * T, C, H, W)
         backbone = self.backbone
 
-        # --- Standard InfMAE forward pass (no masking) ---
-        mask_shape_1 = (frames_flat.shape[0], 56, 56)
-        mask_for_patch1 = torch.ones(mask_shape_1, device=frames_flat.device).unsqueeze(1)
-        mask_shape_2 = (frames_flat.shape[0], 28, 28)
-        mask_for_patch2 = torch.ones(mask_shape_2, device=frames_flat.device).unsqueeze(1)
-
+        # --- InfMAE forward pass ---
+        # Stage 1
         x = backbone.patch_embed1(frames_flat)
-        for blk in backbone.blocks1: x = blk(x, mask_for_patch1)
-        stage1_embed = backbone.stage1_output_decode(x).flatten(2).permute(0, 2, 1)
+        for blk in backbone.blocks1: x = blk(x)  # No mask needed
 
+        # Stage 2
         x = backbone.patch_embed2(x)
-        for blk in backbone.blocks2: x = blk(x, mask_for_patch2)
-        stage2_embed = backbone.stage2_output_decode(x).flatten(2).permute(0, 2, 1)
+        for blk in backbone.blocks2: x = blk(x)  # No mask needed
+        features_for_head = x  # Features from Stage 2 go to the head
 
-        x = backbone.patch_embed3(x).flatten(2).permute(0, 2, 1)
+        # Stage 3 (ViT part with AIM blocks)
+        x = backbone.patch_embed3(features_for_head).flatten(2).permute(0, 2, 1)
         x = backbone.patch_embed4(x)
         x = x + backbone.pos_embed
-
-        # Apply the original ViT blocks (now with injected LoRA layers)
-        for blk in backbone.blocks3:
-            x = blk(x)
-
-        x = x + stage1_embed + stage2_embed
-        latent = backbone.norm(x)  # Final features: (B*T, N, D)
+        for blk in self.backbone.blocks3:
+            x = blk(x, num_frames=T)  # Pass T to AIMBlock
 
         # --- Detection Head ---
-        predictions = self.detection_head(latent)  # (B*T, N, num_classes + 1 + 4)
+        head_outputs = self.detection_head(features_for_head)
 
-        num_patches = predictions.shape[1]
-        predictions = predictions.view(B, T, num_patches, -1)
+        outputs = {}
+        for key, value in head_outputs.items():
+            _, C_out, H_out, W_out = value.shape
+            outputs[key] = value.view(B, T, C_out, H_out, W_out)
 
-        pred_logits = predictions[..., :self.num_classes + 1]
-        pred_boxes = predictions[..., self.num_classes + 1:]
-        return {'pred_logits': pred_logits, 'pred_boxes': pred_boxes.sigmoid()}
+        return outputs
