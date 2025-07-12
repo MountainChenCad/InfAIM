@@ -1,11 +1,10 @@
-# 文件: engine_finetune.py (版本 36 - 阈值分析)
+# 文件: engine_finetune.py (版本 37 - IoU阈值评估)
 # 核心改动:
-# 1. (FEATURE) 重构 `evaluate` 函数以进行全面的性能分析。
-# 2. (FEATURE) 函数现在首先对所有验证序列进行一次推理，收集原始预测结果。
-# 3. (FEATURE) 然后，它会遍历一系列预定义的置信度阈值 (0.1 to 0.9)。
-# 4. (FEATURE) 对每个阈值，它都会重新计算完整的指标（召回率、虚警率、稳定性），
-#    从而能够清晰地展示阈值对性能的影响。
-# 5. (REFACTOR) 函数现在返回一个包含每个阈值结果的列表，而不再是单个字典。
+# 1. (FEATURE) 添加IoU计算函数，支持中心点坐标格式(cx, cy, w, h)
+# 2. (REFACTOR) 将评估逻辑从距离阈值改为IoU阈值(>0.3)
+# 3. (REFACTOR) 更新匹配逻辑，使用IoU进行真正例/假正例判断
+# 4. (FEATURE) 规范可视化命名格式，保持置信度扫描功能
+# 5. (OPTIMIZATION) 保持模型结构不变，确保训练连续性
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +15,37 @@ import sys
 from typing import Iterable
 import numpy as np
 import os
+
+
+def box_cxcywh_to_xyxy(boxes):
+    """Convert center format (cx, cy, w, h) to corner format (x1, y1, x2, y2)"""
+    cx, cy, w, h = boxes.unbind(-1)
+    x1 = cx - w / 2
+    y1 = cy - h / 2
+    x2 = cx + w / 2
+    y2 = cy + h / 2
+    return torch.stack([x1, y1, x2, y2], dim=-1)
+
+
+def compute_iou(boxes1, boxes2):
+    """
+    Compute IoU between two sets of boxes
+    boxes1: (N, 4) in format (x1, y1, x2, y2)
+    boxes2: (M, 4) in format (x1, y1, x2, y2)
+    Returns: (N, M) IoU matrix
+    """
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # (N, M, 2)
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # (N, M, 2)
+
+    wh = (rb - lt).clamp(min=0)  # (N, M, 2)
+    inter = wh[:, :, 0] * wh[:, :, 1]  # (N, M)
+
+    union = area1[:, None] + area2 - inter
+    iou = inter / union.clamp(min=1e-6)
+    return iou
 
 
 # ... (Loss Functions, train_one_epoch, Post-processing Functions remain unchanged) ...
@@ -154,8 +184,6 @@ def centernet_decode(heat, wh, reg, K=100):
     return detections
 
 
-# File: engine_finetune.py
-# --- Corrected Code ---
 @torch.no_grad()
 def evaluate(model, data_loader, device, output_dir, epoch):
     model.eval()
@@ -191,21 +219,21 @@ def evaluate(model, data_loader, device, output_dir, epoch):
             'preds': detections,
             'gts': targets,
             'seq_len': sequence_len,
-            'output_res': seq_pred_heat.shape[-1]
+            'seq_name': seq_name
         })
 
     # Step 2: Initialize metric counters for each threshold
     print("Evaluating metrics across all frames and thresholds...")
     thresholds_to_test = np.arange(0.1, 0.91, 0.05)
-    dist_threshold, stability_threshold = 3.0, 0.8
+    iou_threshold, stability_threshold = 0.3, 0.8
 
     stats_by_thresh = {f"{th:.2f}": {'tp': 0, 'fp': 0, 'fn': 0, 'stable_sequences': 0} for th in thresholds_to_test}
     total_sequences = len(all_sequence_data)
 
     # Step 3: Iterate through sequences and frames ONCE
     for seq_data in metric_logger.log_every(all_sequence_data, 1, "Processing sequences:"):
-        detections, targets, sequence_len, output_res = \
-            seq_data['preds'], seq_data['gts'], seq_data['seq_len'], seq_data['output_res']
+        detections, targets, sequence_len = \
+            seq_data['preds'], seq_data['gts'], seq_data['seq_len']
 
         consistent_frames_by_thresh = {f"{th:.2f}": 0 for th in thresholds_to_test}
 
@@ -214,11 +242,11 @@ def evaluate(model, data_loader, device, output_dir, epoch):
             gt_boxes = targets[t]['boxes'].to(device)
             gt_labels = targets[t]['labels'].to(device)
 
-            dist_matrix = torch.empty(0, device=device)
-            if gt_boxes.shape[0] > 0 and preds_t.shape[0] > 0:
-                pred_centers_feat_scale = preds_t[:, :2] * output_res
-                gt_centers_feat_scale = gt_boxes[:, :2] * output_res
-                dist_matrix = torch.cdist(pred_centers_feat_scale, gt_centers_feat_scale)
+            # Convert boxes to xyxy format for IoU calculation
+            if gt_boxes.shape[0] > 0:
+                gt_boxes_xyxy = box_cxcywh_to_xyxy(gt_boxes)
+            else:
+                gt_boxes_xyxy = torch.empty((0, 4), device=device)
 
             for conf_threshold in thresholds_to_test:
                 key = f"{conf_threshold:.2f}"
@@ -228,19 +256,24 @@ def evaluate(model, data_loader, device, output_dir, epoch):
                 gt_matched = torch.zeros(gt_boxes.shape[0], device=device, dtype=torch.bool)
                 pred_matched_indices = torch.zeros(preds_t.shape[0], device=device, dtype=torch.bool)
 
-                if gt_boxes.shape[0] > 0 and pred_indices.shape[0] > 0 and dist_matrix.numel() > 0:
-                    frame_dist_matrix_filtered = dist_matrix[pred_indices, :]
+                if gt_boxes.shape[0] > 0 and pred_indices.shape[0] > 0:
+                    # Get prediction boxes and convert to xyxy format
+                    pred_boxes_filtered = preds_t[pred_indices, :4]
+                    pred_boxes_xyxy = box_cxcywh_to_xyxy(pred_boxes_filtered)
 
-                    if frame_dist_matrix_filtered.numel() > 0:
-                        closest_pred_dist, closest_filtered_idx = frame_dist_matrix_filtered.min(dim=0)
+                    # Compute IoU matrix
+                    iou_matrix = compute_iou(pred_boxes_xyxy, gt_boxes_xyxy)
 
-                        for gt_idx, filtered_idx in enumerate(closest_filtered_idx):
-                            original_pred_idx = pred_indices[filtered_idx]
+                    # Find best matches
+                    max_iou_per_gt, best_pred_idx_per_gt = iou_matrix.max(dim=0)
+
+                    for gt_idx, (best_pred_idx, max_iou) in enumerate(zip(best_pred_idx_per_gt, max_iou_per_gt)):
+                        if max_iou > iou_threshold:
+                            original_pred_idx = pred_indices[best_pred_idx]
                             pred_class = preds_t[original_pred_idx, 5].int().item()
                             gt_class = gt_labels[gt_idx].item()
 
-                            if closest_pred_dist[gt_idx] < dist_threshold and pred_class == gt_class and not \
-                            pred_matched_indices[original_pred_idx]:
+                            if pred_class == gt_class and not pred_matched_indices[original_pred_idx]:
                                 stats_by_thresh[key]['tp'] += 1
                                 gt_matched[gt_idx] = True
                                 pred_matched_indices[original_pred_idx] = True
@@ -286,6 +319,10 @@ def visualize_epoch(model, data_loader, device, output_dir, epoch, vis_folder_na
     os.makedirs(vis_dir, exist_ok=True);
     header = f'Visualizing {vis_folder_name}:';
     metric_logger = misc.MetricLogger(delimiter="  ")
+
+    # Add sequence counter to avoid naming conflicts
+    seq_counter = 0
+
     for seq_name_tuple, sequence_cpu, gt_targets in metric_logger.log_every(data_loader, 1, header):
         seq_name = seq_name_tuple[0]  # Dataloader wraps it in a tuple/list
         sequence_gpu = sequence_cpu.to(device);
@@ -316,5 +353,13 @@ def visualize_epoch(model, data_loader, device, output_dir, epoch, vis_folder_na
             keep = scores > 0.3
             preds_for_vis.append({'boxes': preds_t[keep, :4], 'scores': scores[keep], 'labels': preds_t[keep, 5].int()})
 
-        video_path = os.path.join(vis_dir, f"{seq_name}_epoch_{epoch}.mp4");
+        # Enhanced naming format to avoid conflicts
+        # Format: {folder_type}_{sequence_counter:03d}_{clean_seq_name}_epoch_{epoch:02d}.mp4
+        folder_type = vis_folder_name.split('_')[0]  # 'val' or 'train'
+        clean_seq_name = seq_name.replace('/', '_').replace('\\', '_')[:20]  # Clean and limit length
+        video_filename = f"{folder_type}_{seq_counter:03d}_{clean_seq_name}_epoch_{epoch:02d}.mp4"
+        video_path = os.path.join(vis_dir, video_filename)
+
         save_eval_video(sequence_cpu, gt_targets, preds_for_vis, video_path)
+
+        seq_counter += 1

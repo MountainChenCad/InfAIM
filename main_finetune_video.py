@@ -52,10 +52,10 @@ def get_args_parser():
     parser.add_argument('--output_dir', default='./output_finetune', help='path where to save')
     parser.add_argument('--device', default='cuda', help='device to use for training');
     parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--resume', default='output_finetune/checkpoint_epoch_19.pth', help='resume from checkpoint');
+    parser.add_argument('--resume', default='output_finetune/checkpoint_epoch_11.pth', help='resume from checkpoint');
     parser.add_argument('--start_epoch', default=0, type=int)
     parser.add_argument('--num_workers', default=0, type=int);
-    parser.add_argument('--train_data_fraction', type=float, default=0.001,
+    parser.add_argument('--train_data_fraction', type=float, default=1,
                         help='Fraction of training data to use (e.g. 0.2 for 20%)')
     parser.add_argument('--world_size', default=1, type=int);
     parser.add_argument('--local_rank', default=-1, type=int)
