@@ -40,9 +40,14 @@ def collate_fn_val(batch): return batch[0]
 
 def get_args_parser():
     parser = argparse.ArgumentParser('InfMAE Video Detection Fine-tuning', add_help=False)
-    parser.add_argument('--batch_size', default=8, type=int);
+    parser.add_argument('--batch_size', default=4, type=int);
     parser.add_argument('--epochs', default=40, type=int)
-    parser.add_argument('--lr', type=float, default=1e-5);
+    # ========================= 核心修改点 =========================
+    # 1. 进一步降低学习率
+    parser.add_argument('--lr', type=float, default=1e-6, help='learning rate (default: 1e-6 for stable full fine-tuning)')
+    # 2. 添加梯度裁剪参数
+    parser.add_argument('--clip_grad', type=float, default=0.1, help='gradient clipping max norm')
+    # ==========================================================
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--pretrained_weights', default='./checkpoints/infmae_pretrained_weights.pth', type=str)
     parser.add_argument('--num_classes', default=6, type=int);
@@ -52,7 +57,7 @@ def get_args_parser():
     parser.add_argument('--output_dir', default='./output_finetune', help='path where to save')
     parser.add_argument('--device', default='cuda', help='device to use for training');
     parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--resume', default='output_finetune/checkpoint_epoch_11.pth', help='resume from checkpoint');
+    parser.add_argument('--resume', default='', help='resume from checkpoint');  # 清空resume
     parser.add_argument('--start_epoch', default=0, type=int)
     parser.add_argument('--num_workers', default=0, type=int);
     parser.add_argument('--train_data_fraction', type=float, default=1,
@@ -74,8 +79,10 @@ def main(args):
     transform = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor(),
                                     transforms.Normalize(mean=[0.425, 0.425, 0.425], std=[0.200, 0.200, 0.200])])
     base_path = args.data_path
-    train_scene_paths = [os.path.join(base_path, d) for d in ['scene_1', 'scene_2', 'scene_3']];
-    val_scene_paths = [os.path.join(base_path, 'contest_1')]
+    train_scene_paths = [os.path.join(base_path, d) for d in ['scene_1']];
+
+    val_scene_paths = [os.path.join(base_path, 'contest_1_scene_1')]
+    # val_scene_paths = [os.path.join(base_path, 'contest_1')]
     dataset_train = VideoDetectionDataset(scene_paths=train_scene_paths, clip_length=args.clip_length,
                                           transform=transform, return_clips=True, num_classes=args.num_classes)
     if args.train_data_fraction < 1.0:

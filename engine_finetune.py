@@ -69,8 +69,26 @@ def _neg_loss(pred, gt):  # Focal Loss
 def _reg_l1_loss(output, mask, index, target):  # L1 Loss for WH and Offset
     pred = _transpose_and_gather_feat(output, index);
     mask = mask.unsqueeze(2).expand_as(pred).float()
-    loss = F.l1_loss(pred * mask, target * mask, reduction='sum');
-    loss = loss / (mask.sum() + 1e-4)
+
+    # ========================= 核心修改点 =========================
+    # 添加数值稳定性改进
+    masked_pred = pred * mask
+    masked_target = target * mask
+
+    # 检查是否有有效的mask
+    valid_mask_count = mask.sum()
+    if valid_mask_count == 0:
+        return torch.tensor(0.0, device=output.device, requires_grad=True)
+
+    # 使用smooth L1 loss代替L1 loss提高稳定性
+    diff = torch.abs(masked_pred - masked_target)
+    loss = torch.where(diff < 1.0, 0.5 * diff * diff, diff - 0.5)
+    loss = loss.sum() / (valid_mask_count + 1e-6)  # 更大的epsilon
+
+    # 限制损失的最大值
+    loss = torch.clamp(loss, max=100.0)
+    # ==========================================================
+
     return loss
 
 
@@ -121,10 +139,25 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: to
         hm_loss = _neg_loss(hm_pred, hm_gt);
         wh_loss = _reg_l1_loss(wh_pred, ind_mask_gt, ind_gt, wh_gt);
         offset_loss = _reg_l1_loss(offset_pred, ind_mask_gt, ind_gt, offset_gt)
-        loss = hm_loss + 0.1 * wh_loss + offset_loss
-        if not math.isfinite(loss.item()): print(f"Loss is {loss.item()}, stopping training"); sys.exit(1)
+
+        # ========================= 核心修改点 =========================
+        # 1. 调整损失权重，降低offset_loss的影响
+        loss = hm_loss + 0.1 * wh_loss + 0.01 * offset_loss  # 从1.0降到0.01
+
+        # 2. 添加数值稳定性检查
+        if not math.isfinite(loss.item()):
+            print(f"Loss is {loss.item()}, stopping training")
+            print(f"hm_loss: {hm_loss.item()}, wh_loss: {wh_loss.item()}, offset_loss: {offset_loss.item()}")
+            sys.exit(1)
+
         optimizer.zero_grad();
         loss.backward();
+
+        # 3. 添加梯度裁剪
+        if hasattr(args, 'clip_grad') and args.clip_grad > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+        # ==========================================================
+
         optimizer.step()
         metric_logger.update(loss=loss.item(), hm_loss=hm_loss.item(), wh_loss=wh_loss.item(),
                              off_loss=offset_loss.item());
@@ -320,9 +353,6 @@ def visualize_epoch(model, data_loader, device, output_dir, epoch, vis_folder_na
     header = f'Visualizing {vis_folder_name}:';
     metric_logger = misc.MetricLogger(delimiter="  ")
 
-    # Add sequence counter to avoid naming conflicts
-    seq_counter = 0
-
     for seq_name_tuple, sequence_cpu, gt_targets in metric_logger.log_every(data_loader, 1, header):
         seq_name = seq_name_tuple[0]  # Dataloader wraps it in a tuple/list
         sequence_gpu = sequence_cpu.to(device);
@@ -353,13 +383,40 @@ def visualize_epoch(model, data_loader, device, output_dir, epoch, vis_folder_na
             keep = scores > 0.3
             preds_for_vis.append({'boxes': preds_t[keep, :4], 'scores': scores[keep], 'labels': preds_t[keep, 5].int()})
 
-        # Enhanced naming format to avoid conflicts
-        # Format: {folder_type}_{sequence_counter:03d}_{clean_seq_name}_epoch_{epoch:02d}.mp4
-        folder_type = vis_folder_name.split('_')[0]  # 'val' or 'train'
-        clean_seq_name = seq_name.replace('/', '_').replace('\\', '_')[:20]  # Clean and limit length
-        video_filename = f"{folder_type}_{seq_counter:03d}_{clean_seq_name}_epoch_{epoch:02d}.mp4"
+        # ========================= 核心修改点 =========================
+        # 增强的命名逻辑，确保每个序列在每个epoch都有唯一文件名
+
+        # 1. 解析序列名称，提取场景和序列信息
+        # seq_name format example: "scene_1_seq_001" or "contest_1_seq_005"
+        parts = seq_name.split('_')
+        if len(parts) >= 3:
+            scene_part = '_'.join(parts[:-2])  # "scene_1" or "contest_1"
+            seq_part = '_'.join(parts[-2:])  # "seq_001"
+        else:
+            scene_part = seq_name[:15]  # Fallback: truncate long names
+            seq_part = "unknown"
+
+        # 2. 清理特殊字符
+        scene_clean = scene_part.replace('/', '_').replace('\\', '_').replace(' ', '_')
+        seq_clean = seq_part.replace('/', '_').replace('\\', '_').replace(' ', '_')
+
+        # 3. 确定数据集类型
+        dataset_type = 'val' if 'val' in vis_folder_name else 'train'
+
+        # 4. 构建唯一且描述性的文件名
+        # Format: {dataset}_{scene}_{sequence}_epoch{epoch:02d}.mp4
+        video_filename = f"{dataset_type}_{scene_clean}_{seq_clean}_epoch{epoch:02d}.mp4"
         video_path = os.path.join(vis_dir, video_filename)
 
-        save_eval_video(sequence_cpu, gt_targets, preds_for_vis, video_path)
+        # 5. 检查文件是否已存在，如果存在则添加时间戳避免覆盖
+        if os.path.exists(video_path):
+            import time
+            timestamp = int(time.time()) % 10000  # 使用时间戳后4位
+            base_name = video_filename.replace('.mp4', '')
+            video_filename = f"{base_name}_ts{timestamp}.mp4"
+            video_path = os.path.join(vis_dir, video_filename)
 
-        seq_counter += 1
+        print(f"Saving visualization video: {video_filename}")
+        # ==========================================================
+
+        save_eval_video(sequence_cpu, gt_targets, preds_for_vis, video_path)
